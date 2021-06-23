@@ -7,12 +7,165 @@ Parameters:
     Type: String
   EC2AMI:
     # This is a special parameter type that allows our template to get the latest AMI without having to specify the exact version
-    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
-    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
 Mappings:
 
 Conditions:
 
 Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: 
+      #!Sub is a CloudFormation function that performs string interpolation. Here we interpolate the Stack name into the Security group description
+      #AWS::StackName is a CloudFormation pseudo paramter. There are other useful ones 
+      GroupDescription: !Sub 'Internal Security group for ${AWS::StackName}' 
+      VpcId:
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+       #Tags are great. It makes sense to tag most resources with the stack name if you are going to have multiple stacks in the same AWS account 
+      Tags:
+        - Key:  Name
+        #!Ref is a CloudFormation function for reffering to other resources in your stack.
+          Value:  !Ref AWS::StackName
+  # The IAM/Instance role will be used by our EC2 instance to define its permissions 
+  # At the moment we are granting out instance role full access to CloudWatch
+  # Other Managed Policies are available - choose based on what you app needs        
+  InstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version:  "2012-10-17"
+        Statement: 
+          Effect: Allow
+          Principal:
+            Service: 
+            - "ec2.amazonaws.com"
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+      Tags:
+        - Key:  Name 
+          Value: !Ref AWS::StackName
+  #We create an instance profile to tie our IAM/Instance Role to the EC2 instance we'll create     
+  InstanceProfile:
+    Type: "AwS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - Ref: InstanceRole
+  #Creating our final resource - the EC2 instance itself 
+  Instance:
+    Type: "AwS::EC2::Instance"
+    CreationPolicy:
+    #This tells CloudFormation to wait for a signal before marking the new instance as created - see install script
+      ResourceSignal:
+          Timeout:  PT15M
+          Count: 1
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+          # Here we define some prereqs that cloudFormation will install on our instance (the wget and unzip utilities)
+          # We need them to install our application
+            yum: 
+              wget: []
+              unzip: []
+    Properties:
+      #The AMI ID that we take as a template parameter
+      ImageId: !Ref EC2AMI
+      #The EC2 instance type that we take as a template parameter.
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      Monitoring: true
+      SecurityGroupIds: 
+      #!GetAtt is a CloudFormation function that can reference attributes from other resources
+        - !GetAtt SecurityGroup.GroupId 
+      UserData: 
+      # Filling in the userdata section allows us to run commands on our instance when it launches
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          #xe - x means to list out all commands that have taken place and e means to exit on error
 
+          # send script ouput to /tmp so we can debug boot failures
+          # The output of the UserData script will be written to /tmp/userdata.log. 
+          # Look there if you need to debug any launch issues.
+          exec > /tmp/userdata.log 2>&1
+          
+          # Update all packages
+          yum - y update
+
+          # Get latest cfn scripts; https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/best-practices.html#cfninit
+          yum install -y aws-cfn-bootstrap
+
+          # Have Cloudformation install any files and packages from the metadata
+          # This is where the wget and unzip utilities will egt installed
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --region ${AWS::Region} -- resource Instance
+
+          # This creates an install script using "cat" and instructs the shell to read the multiline script until EOF
+          # This script will replace the manual setup of the EC2 we ran previously
+          cat > /tmp/install_script.sh
+            # START
+            echo "Setting up Node Environment"
+            #installing nvm on linux
+            curl https://raw.githubusercontent.com/nvm-sh/nvm/v0.34.0/install.sh | bash
+
+            #Dot source the files to ensure that variables are available within the current shell
+            #Dot sourcing allows you to reference code defined in one script in a seperate one
+            # here we are dotsourcing the nvm install script and our bash shell config file.
+
+            . /home/ec2-user/.nvm/nvm.sh
+            . /home/ec2-user/.bashrc
+
+            #Install NPM and Node.js
+            # nvm alias default will set your version of node which perists even if you close your shell
+            # nvm install will install that version of node and npm
+            # nvm use will use the specified installed version in that shell
+
+            nvm alias default v12.7.0
+            nvm install v12.7.0
+            nvm use v12.7.0
+
+            # Download latest code and unzip it into /home/ec2-user/app
+            wget https://github.com/DJ-argus/test-aws/archive/main.zip
+            unzip main.zip
+            mv test-aws-main app
+
+            # Create log directory 
+            mkdir -p /home/ece-user/app/logs
+
+            #run server 
+            cd app
+            npm install
+            npm start
+          EOF
+
+          #change current owner and group owner of install script to ec2-user
+          #AND give all the users (current user and those in the group) executable permissions
+          chown ec2-user:ec2-user  /tmp/install_script.sh && chmod a+x /tmp/install_script.sh
+
+          #runs the install-script as the ec2-user
+          #pauses the shell for 1 second then substitutes user to ec2-user and then executes the instal script
+          sleep 1; su - ec2-user -c "/tmp/install_script.sh"
+
+          #Signal to CloudFormation that the instance is ready
+          #Signals to CloudFormation that the instance setup is complete
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --region ${AWS::Region} --resource Instance
+
+      Tags: 
+        - Key: Name
+          Value:  !Ref AWS::StackName
+#We can export the DNS name of our newly created instance as a template output
 Outputs:
+  InstanceEndpoint: 
+  Description: The DNS name for the created instance
+  Value: !Sub "http://${Instance.PublicDnsName}:8080"
+  Export: 
+    Name: InstanceEndpoint
